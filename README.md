@@ -52,6 +52,10 @@ MQTT v5 server
 6.1.	Autentificare: 
 6.1.1.	Vom avea o autentificarea simplă prin nume de utilizator/parolă .
 9.	Implementarea manipulării și înregistrării erorilor
+
+![image](https://github.com/user-attachments/assets/0f2bbd49-519b-4083-ae99-88b0520d0b7e)
+
+
 7.1.	Coduri de eroare: 
 7.1.1.	Implementarea codurile de eroare MQTT v5 pentru a trimite feedback clar clienților.
 7.2.	Înregistrare:
