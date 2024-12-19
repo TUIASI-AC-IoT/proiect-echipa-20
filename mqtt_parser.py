@@ -179,5 +179,7 @@ PACKET_TYPES = {
     9: "SUBACK",
     10: "UNSUBSCRIBE",
     11: "UNSUBACK",
+    12: "PINGREQ",
+    13: "PINGRESP",
     14: "DISCONNECT",
 }
