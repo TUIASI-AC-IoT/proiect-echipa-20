@@ -5,7 +5,7 @@ import logging
 import json
 
 from mqtt_parser import parse_fixed_header, parse_connect_packet, PACKET_TYPES, parse_publish_packet, \
-    parse_variable_byte_integer, parse_subscribe_properties
+    parse_variable_byte_integer, parse_subscribe_properties, parse_unsubscribe_packet
 
 # Server configuration
 HOST = '127.0.0.1'  # Localhost for testing
@@ -167,52 +167,25 @@ def construct_unsuback_packet(packet_id):
 def handle_unsubscribe_packet(data, client_socket, client_address):
     """Handle the UNSUBSCRIBE packet."""
     try:
-        # Parse Fixed Header
-        packet_type, flags, remaining_length, fixed_header_length = parse_fixed_header(data)
-        offset = fixed_header_length
+        # Call parse_unsubscribe_packet to get packet_id and topics
+        packet_id, topics = parse_unsubscribe_packet(data)
 
-        # Parse Packet Identifier
-        if offset + 2 > len(data):
-            raise ValueError("Incomplete packet: Unable to read Packet Identifier")
-        packet_id = (data[offset] << 8) | data[offset + 1]
-        offset += 2
-        log_event("UNSUBSCRIBE", f"Packet ID: {packet_id}", client_address=client_address)
-
-        # Parse Topic Filters
-        topics = []
-        while offset - fixed_header_length < remaining_length:
-            if offset + 2 > len(data):
-                raise ValueError("Incomplete packet: Unable to read Topic Name Length")
-
-            topic_name_len = (data[offset] << 8) | data[offset + 1]
-            offset += 2
-
-            if topic_name_len == 0:
-                raise ValueError("Empty topic name is not allowed.")
-            if offset + topic_name_len > len(data):
-                raise ValueError("Incomplete packet: Topic Name exceeds remaining data")
-
-            topic_name = data[offset:offset + topic_name_len].decode('utf-8')
-            offset += topic_name_len
-            topics.append(topic_name)
-
-            # Remove client from subscriptions
-            if topic_name in subscriptions:
-                if client_socket in subscriptions[topic_name]:
-                    subscriptions[topic_name].remove(client_socket)
+        for topic in topics:
+            if topic in subscriptions:
+                if client_socket in subscriptions[topic]:
+                    subscriptions[topic].remove(client_socket)
                     log_event(
                         "UNSUBSCRIBE",
-                        f"Client unsubscribed from topic: {topic_name}",
+                        f"Client unsubscribed from topic: {topic}",
                         client_address=client_address
                     )
-                    if not subscriptions[topic_name]:  # Cleanup empty topic
-                        del subscriptions[topic_name]
+                    if not subscriptions[topic]:  # Cleanup empty topic
+                        del subscriptions[topic]
 
         # Construct and send UNSUBACK
         unsuback_packet = construct_unsuback_packet(packet_id)
         client_socket.send(unsuback_packet)
-
-        log_event("UNSUBSCRIBE", f"Unsubscribed from topics: {topics}", client_address=client_address)
+        log_event("UNSUBACK", "UNSUBACK sent", client_address=client_address, additional_data={"packet_id": packet_id})
 
     except ValueError as ve:
         log_event("ERROR", f"Error processing UNSUBSCRIBE packet: {ve}", client_address=client_address)
