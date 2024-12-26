@@ -145,6 +145,78 @@ def parse_variable_byte_integer(data):
         multiplier *= 128
     return value, bytes_read
 
+
+def parse_unsubscribe_packet(data):
+    """Parse an UNSUBSCRIBE packet with detailed logging."""
+    try:
+        # Parse Fixed Header
+        packet_type, flags, remaining_length, fixed_header_length = parse_fixed_header(data)
+        print(
+            f"Fixed Header: Packet Type={packet_type}, Flags={flags}, Remaining Length={remaining_length}, Fixed Header Length={fixed_header_length}")
+
+        # Validate Fixed Header
+        if packet_type != 10:
+            raise ValueError(f"Malformed UNSUBSCRIBE packet: Incorrect packet type {packet_type}.")
+        if flags != 0b0010:
+            raise ValueError(f"Malformed UNSUBSCRIBE packet: Incorrect flags {bin(flags)}.")
+
+        offset = fixed_header_length
+
+        # Read Packet Identifier
+        if offset + 2 > len(data):
+            raise ValueError("Incomplete UNSUBSCRIBE packet: Unable to read Packet Identifier.")
+        packet_id = (data[offset] << 8) | data[offset + 1]
+        print(f"Packet Identifier: {packet_id} (Offset: {offset}-{offset + 2})")
+        offset += 2
+
+        # Parse Properties
+        if offset >= len(data):
+            raise ValueError("Malformed UNSUBSCRIBE packet: Missing property length field.")
+
+        property_length, property_length_size = parse_variable_byte_integer(data[offset:])
+        print(f"Property Length: {property_length} (Size: {property_length_size})")
+        offset += property_length_size
+
+        # Skip Properties (if any)
+        if offset + property_length > len(data):
+            raise ValueError("Malformed UNSUBSCRIBE packet: Property length exceeds remaining data.")
+        offset += property_length
+
+        # Parse Topics
+        topics = []
+        while offset < len(data):
+            print(f"Parsing topic at Offset: {offset}, Remaining Data (hex): {data[offset:].hex()}")
+            if offset + 2 > len(data):
+                raise ValueError("Incomplete UNSUBSCRIBE packet: Unable to read Topic Name Length.")
+
+            # Read Topic Name Length
+            topic_length = (data[offset] << 8) | data[offset + 1]
+            print(f"Topic Name Length: {topic_length} (Offset: {offset}-{offset + 2})")
+            offset += 2
+
+            if topic_length == 0:
+                raise ValueError("Empty topic name is not allowed.")
+
+            if offset + topic_length > len(data):
+                raise ValueError("Incomplete UNSUBSCRIBE packet: Topic Name exceeds remaining data.")
+
+            # Read Topic Name
+            topic_name = data[offset:offset + topic_length].decode('utf-8')
+            print(f"Topic Name: {topic_name} (Offset: {offset}-{offset + topic_length})")
+            offset += topic_length
+            topics.append(topic_name)
+
+        # Verify Remaining Length Alignment
+        parsed_length = offset - fixed_header_length
+        if parsed_length != remaining_length:
+            raise ValueError(f"Remaining Length mismatch: Parsed {parsed_length}, Expected {remaining_length}.")
+
+        return packet_id, topics
+    except Exception as e:
+        print(f"Error parsing UNSUBSCRIBE packet: {e}")
+        raise
+
+
 def parse_subscribe_properties(data):
     """Parse properties of the SUBSCRIBE packet."""
     properties = {}
