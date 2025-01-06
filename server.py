@@ -21,6 +21,7 @@ logging.basicConfig(
     ]
 )
 
+
 def log_event(event_type, message, client_address=None, additional_data=None):
     """Log an event with structured data."""
     log_entry = {
@@ -31,9 +32,11 @@ def log_event(event_type, message, client_address=None, additional_data=None):
     }
     logging.info(json.dumps(log_entry))
 
+
 # Subscription registry
 subscriptions = {}  # Dictionary to track subscribers: {topic: [client_sockets]}
 retained_messages = {}  # Dictionary to store retained messages: {topic: payload}
+
 
 def handle_client(client_socket, client_address):
     """Handle an individual MQTT client."""
@@ -56,6 +59,8 @@ def handle_client(client_socket, client_address):
                 handle_connect_packet(data, client_socket, client_address)
             elif packet_type == 3:  # PUBLISH
                 handle_publish_packet(data, client_socket, client_address)
+            elif packet_type == 6:  # PUBREL (QoS 2)
+                handle_pubrel(data, client_socket)
             elif packet_type == 8:  # SUBSCRIBE
                 handle_subscribe_packet(data, client_socket, client_address)
             elif packet_type == 10:  # UNSUBSCRIBE
@@ -70,6 +75,7 @@ def handle_client(client_socket, client_address):
     finally:
         client_socket.close()
 
+
 def handle_connect_packet(data, client_socket, client_address):
     """Handle the CONNECT packet."""
     try:
@@ -78,7 +84,8 @@ def handle_connect_packet(data, client_socket, client_address):
 
         if not client_id:
             client_id = f"auto-{uuid.uuid4().hex[:8]}"
-            log_event("GENERATED_CLIENT_ID", "Generated Client ID", client_address=client_address, additional_data=client_id)
+            log_event("GENERATED_CLIENT_ID", "Generated Client ID", client_address=client_address,
+                      additional_data=client_id)
 
         log_event("CONNECT", f"CONNECT received. Client ID: {client_id}", client_address=client_address)
 
@@ -95,6 +102,7 @@ def handle_connect_packet(data, client_socket, client_address):
     except Exception as e:
         log_event("ERROR", f"Error processing CONNECT packet: {e}", client_address=client_address)
 
+
 def construct_suback_packet(packet_id, granted_qos_list):
     """Construct a SUBACK packet."""
     try:
@@ -104,11 +112,14 @@ def construct_suback_packet(packet_id, granted_qos_list):
 
         remaining_length = len(variable_header) + len(payload)
         suback_packet = fixed_header + remaining_length.to_bytes(1, 'big') + variable_header + payload
-        log_event("SUBACK_CONSTRUCTED", "SUBACK packet constructed", additional_data={"packet_id": packet_id, "granted_qos_list": granted_qos_list})
+        log_event("SUBACK_CONSTRUCTED", "SUBACK packet constructed",
+                  additional_data={"packet_id": packet_id, "granted_qos_list": granted_qos_list})
         return suback_packet
     except Exception as e:
-        log_event("ERROR", f"Error constructing SUBACK packet: {e}", additional_data={"packet_id": packet_id, "granted_qos_list": granted_qos_list})
+        log_event("ERROR", f"Error constructing SUBACK packet: {e}",
+                  additional_data={"packet_id": packet_id, "granted_qos_list": granted_qos_list})
         raise
+
 
 def handle_subscribe_packet(data, client_socket, client_address):
     """Handle the SUBSCRIBE packet."""
@@ -156,6 +167,7 @@ def handle_subscribe_packet(data, client_socket, client_address):
     except Exception as e:
         log_event("ERROR", f"Error processing SUBSCRIBE packet: {e}", client_address=client_address)
 
+
 def construct_unsuback_packet(packet_id):
     """Construct an UNSUBACK packet."""
     fixed_header = b'\xB0'  # Packet Type = UNSUBACK
@@ -199,23 +211,81 @@ def handle_publish_packet(data, client_socket, client_address):
         publish_info = parse_publish_packet(data)
         topic_name = publish_info["topic_name"]
         payload = publish_info["payload"]
+        qos_level = publish_info["qos_level"]
+        packet_id = publish_info.get("packet_id", None)
 
-        log_event("PUBLISH", f"PUBLISH received for topic {topic_name}", client_address=client_address, additional_data=payload)
+        log_event("PUBLISH", f"PUBLISH received for topic {topic_name} with QoS {qos_level}", client_address=client_address, additional_data=payload)
 
+        # Handle retained messages
         retain_flag = publish_info.get("retain_flag", 0)
         if retain_flag:
             retained_messages[topic_name] = payload
 
+        # Deliver the message to subscribers
         if topic_name in subscriptions:
             for subscriber_socket in subscriptions[topic_name][:]:
                 try:
-                    subscriber_socket.send(data)
+                    subscriber_socket.send(data)  # Send the original PUBLISH packet
                 except Exception as e:
                     subscriptions[topic_name].remove(subscriber_socket)
                     log_event("ERROR", "Failed to deliver message, subscriber removed", additional_data=topic_name)
 
+        # Handle QoS levels
+        if qos_level == 1:
+            send_puback(client_socket, packet_id)
+        elif qos_level == 2:
+            send_pubrec(client_socket, packet_id)
+
     except Exception as e:
         log_event("ERROR", f"Error processing PUBLISH packet: {e}", client_address=client_address)
+
+def send_puback(client_socket, packet_id):
+    """Send PUBACK packet."""
+    try:
+        fixed_header = b'\x40'  # Packet Type = PUBACK
+        variable_header = packet_id.to_bytes(2, 'big')
+        remaining_length = len(variable_header)
+        puback_packet = fixed_header + remaining_length.to_bytes(1, 'big') + variable_header
+        client_socket.send(puback_packet)
+        log_event("PUBACK", "PUBACK sent", additional_data={"packet_id": packet_id})
+    except Exception as e:
+        log_event("ERROR", f"Error sending PUBACK: {e}")
+
+def send_pubrec(client_socket, packet_id):
+    """Send PUBREC packet."""
+    try:
+        fixed_header = b'\x50'  # Packet Type = PUBREC
+        variable_header = packet_id.to_bytes(2, 'big')
+        remaining_length = len(variable_header)
+        pubrec_packet = fixed_header + remaining_length.to_bytes(1, 'big') + variable_header
+        client_socket.send(pubrec_packet)
+        log_event("PUBREC", "PUBREC sent", additional_data={"packet_id": packet_id})
+    except Exception as e:
+        log_event("ERROR", f"Error sending PUBREC: {e}")
+
+def handle_pubrel(data, client_socket):
+    """Handle PUBREL packet."""
+    try:
+        packet_id = int.from_bytes(data[2:4], 'big')
+        log_event("PUBREL", f"PUBREL received for Packet ID {packet_id}")
+
+        # Send PUBCOMP
+        send_pubcomp(client_socket, packet_id)
+    except Exception as e:
+        log_event("ERROR", f"Error handling PUBREL: {e}")
+
+def send_pubcomp(client_socket, packet_id):
+    """Send PUBCOMP packet."""
+    try:
+        fixed_header = b'\x70'  # Packet Type = PUBCOMP
+        variable_header = packet_id.to_bytes(2, 'big')
+        remaining_length = len(variable_header)
+        pubcomp_packet = fixed_header + remaining_length.to_bytes(1, 'big') + variable_header
+        client_socket.send(pubcomp_packet)
+        log_event("PUBCOMP", "PUBCOMP sent", additional_data={"packet_id": packet_id})
+    except Exception as e:
+        log_event("ERROR", f"Error sending PUBCOMP: {e}")
+
 
 def handle_pingreq_packet(client_socket, client_address):
     """Handle the PINGREQ packet."""
