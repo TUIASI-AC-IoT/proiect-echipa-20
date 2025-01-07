@@ -102,7 +102,6 @@ def handle_connect_packet(data, client_socket, client_address):
     except Exception as e:
         log_event("ERROR", f"Error processing CONNECT packet: {e}", client_address=client_address)
 
-
 def construct_suback_packet(packet_id, granted_qos_list):
     """Construct a SUBACK packet."""
     try:
@@ -176,6 +175,8 @@ def construct_unsuback_packet(packet_id):
     return fixed_header + remaining_length.to_bytes(1, 'big') + variable_header
 
 
+qos2_state = {}  # Tracks the state of QoS 2 messages: {client_id: {packet_id: "state"}}
+
 def handle_unsubscribe_packet(data, client_socket, client_address):
     """Handle the UNSUBSCRIBE packet."""
     try:
@@ -204,6 +205,59 @@ def handle_unsubscribe_packet(data, client_socket, client_address):
     except Exception as e:
         log_event("ERROR", f"Unexpected error processing UNSUBSCRIBE packet: {e}", client_address=client_address)
 
+def encode_remaining_length(length):
+    """Encode the remaining length as a Variable Byte Integer."""
+    encoded_bytes = bytearray()
+    while True:
+        byte = length % 128
+        length //= 128
+        if length > 0:
+            byte |= 0x80
+        encoded_bytes.append(byte)
+        if length == 0:
+            break
+    return bytes(encoded_bytes)
+
+
+def send_custom_publish(client_socket, topic_name, payload, qos_level, packet_id):
+    """Send a tailored PUBLISH packet to a subscriber."""
+    try:
+        # Fixed Header
+        flags = 0
+        if qos_level == 1:
+            flags |= 0b0010  # QoS 1
+        elif qos_level == 2:
+            flags |= 0b0100  # QoS 2
+
+        fixed_header = bytes([(0x30 | flags)])  # PUBLISH packet type and flags
+
+        # Variable Header
+        topic_name_bytes = topic_name.encode('utf-8')
+        topic_name_length = len(topic_name_bytes).to_bytes(2, 'big')
+
+        variable_header = topic_name_length + topic_name_bytes
+
+        # QoS 1 and 2 require Packet Identifier
+        if qos_level > 0:
+            variable_header += packet_id.to_bytes(2, 'big')
+
+        # Payload
+        payload_bytes = payload.encode('utf-8')
+
+        # Remaining Length
+        remaining_length = len(variable_header) + len(payload_bytes)
+        remaining_length_bytes = encode_remaining_length(remaining_length)
+
+        # Final Packet
+        publish_packet = fixed_header + remaining_length_bytes + variable_header + payload_bytes
+
+        # Send the packet
+        client_socket.send(publish_packet)
+        log_event("PUBLISH_SENT", f"PUBLISH sent to subscriber with QoS {qos_level}",
+                  additional_data={"topic": topic_name, "qos": qos_level})
+    except Exception as e:
+        log_event("ERROR", f"Error sending PUBLISH to subscriber: {e}")
+
 
 def handle_publish_packet(data, client_socket, client_address):
     """Handle the PUBLISH packet."""
@@ -214,7 +268,8 @@ def handle_publish_packet(data, client_socket, client_address):
         qos_level = publish_info["qos_level"]
         packet_id = publish_info.get("packet_id", None)
 
-        log_event("PUBLISH", f"PUBLISH received for topic {topic_name} with QoS {qos_level}", client_address=client_address, additional_data=payload)
+        log_event("PUBLISH", f"PUBLISH received for topic {topic_name} with QoS {qos_level}",
+                  client_address=client_address, additional_data=payload)
 
         # Handle retained messages
         retain_flag = publish_info.get("retain_flag", 0)
@@ -225,12 +280,12 @@ def handle_publish_packet(data, client_socket, client_address):
         if topic_name in subscriptions:
             for subscriber_socket in subscriptions[topic_name][:]:
                 try:
-                    subscriber_socket.send(data)  # Send the original PUBLISH packet
+                    send_custom_publish(subscriber_socket, topic_name, payload, qos_level, packet_id)
                 except Exception as e:
                     subscriptions[topic_name].remove(subscriber_socket)
                     log_event("ERROR", "Failed to deliver message, subscriber removed", additional_data=topic_name)
 
-        # Handle QoS levels
+        # Handle QoS acknowledgments for the sender
         if qos_level == 1:
             send_puback(client_socket, packet_id)
         elif qos_level == 2:
@@ -267,12 +322,20 @@ def handle_pubrel(data, client_socket):
     """Handle PUBREL packet."""
     try:
         packet_id = int.from_bytes(data[2:4], 'big')
-        log_event("PUBREL", f"PUBREL received for Packet ID {packet_id}")
+        client_id = client_socket.getpeername()  # Identify the client by address
+        log_event("PUBREL", f"PUBREL received for Packet ID {packet_id}", client_address=client_id)
 
-        # Send PUBCOMP
-        send_pubcomp(client_socket, packet_id)
+        # Verify state
+        if client_id in qos2_state and qos2_state[client_id].get(packet_id) == "PUBREC_SENT":
+            # Transition to PUBCOMP
+            send_pubcomp(client_socket, packet_id)
+            qos2_state[client_id][packet_id] = "PUBCOMP_SENT"
+        else:
+            log_event("ERROR", f"Invalid PUBREL state for Packet ID {packet_id}", client_address=client_id)
+
     except Exception as e:
         log_event("ERROR", f"Error handling PUBREL: {e}")
+
 
 def send_pubcomp(client_socket, packet_id):
     """Send PUBCOMP packet."""
