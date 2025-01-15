@@ -17,12 +17,13 @@ def parse_fixed_header(data):
             break
         multiplier *= 128
 
-    print(f"Fixed Header: Packet Type={packet_type}, Flags={flags}, Remaining Length={remaining_length}, Fixed Header Length={fixed_header_length}")
+    print(
+        f"Fixed Header: Packet Type={packet_type}, Flags={flags}, Remaining Length={remaining_length}, Fixed Header Length={fixed_header_length}")
     return packet_type, flags, remaining_length, fixed_header_length
 
 
 def parse_connect_packet(data):
-    """Parse the CONNECT packet."""
+    """Parse the CONNECT packet, including LWT fields."""
     offset = 0
     print(f"Raw data (hex): {data.hex()}")
 
@@ -44,8 +45,11 @@ def parse_connect_packet(data):
 
     # Connect flags
     connect_flags = data[offset]
+    will_flag = (connect_flags & 0x04) >> 2
+    will_qos = (connect_flags & 0x18) >> 3
+    will_retain = (connect_flags & 0x20) >> 5
     clean_session = (connect_flags & 0x02) >> 1
-    print(f"Offset {offset}: Connect Flags = {bin(connect_flags)}, Clean Session = {clean_session}")
+    print(f"Offset {offset}: Connect Flags = {bin(connect_flags)}, Clean Session = {clean_session}, Will Flag = {will_flag}")
     offset += 1
 
     # Keep Alive
@@ -53,17 +57,36 @@ def parse_connect_packet(data):
     print(f"Offset {offset}: Keep Alive = {keep_alive}")
     offset += 2
 
-    # Client ID Length
-    client_id_len = (data[offset] << 8) | data[offset + 1]
-    if client_id_len == 0 and len(data[offset + 2:]) > 0:
-        # Skip extra byte before Client ID
-        print(f"Adjusting offset due to unexpected data: {data[offset + 2:].hex()}")
-        offset += 1  # Skip unexpected byte
-        client_id_len = (data[offset] << 8) | data[offset + 1]
-    offset += 2
+    # Properties
+    property_length, property_length_size = parse_variable_byte_integer(data[offset:])
+    offset += property_length_size
 
+    will_delay_interval = 0
+    user_properties = {}
+    if property_length > 0:
+        end_of_properties = offset + property_length
+        while offset < end_of_properties:
+            property_id = data[offset]
+            offset += 1
+
+            if property_id == 0x18:  # Will Delay Interval
+                will_delay_interval = int.from_bytes(data[offset:offset + 4], 'big')
+                offset += 4
+                print(f"Will Delay Interval: {will_delay_interval}")
+            elif property_id == 0x26:  # User Property
+                key_len = (data[offset] << 8) | data[offset + 1]
+                key = data[offset + 2:offset + 2 + key_len].decode('utf-8')
+                offset += 2 + key_len
+                value_len = (data[offset] << 8) | data[offset + 1]
+                value = data[offset + 2:offset + 2 + value_len].decode('utf-8')
+                offset += 2 + value_len
+                user_properties[key] = value
+                print(f"User Property: {key} = {value}")
 
     # Client ID
+    client_id_len = (data[offset] << 8) | data[offset + 1]
+    offset += 2
+
     if client_id_len == 0 and not clean_session:
         raise ValueError("Empty Client ID with Clean Session = 0")
     elif client_id_len > 0:
@@ -73,7 +96,41 @@ def parse_connect_packet(data):
     else:
         client_id = None
 
-    print(f"Final Offset {offset}: Remaining Data = {data[offset:].hex()}")
+    # Will properties, topic, and message
+    will_topic = None
+    will_message = None
+
+    if will_flag:
+        # Will Properties
+        will_property_length, will_property_length_size = parse_variable_byte_integer(data[offset:])
+        offset += will_property_length_size
+        will_properties_end = offset + will_property_length
+
+        # Parse additional Will properties if needed (e.g., Content Type, Response Topic)
+        while offset < will_properties_end:
+            property_id = data[offset]
+            offset += 1
+
+            if property_id == 0x01:  # Payload Format Indicator
+                payload_format = data[offset]
+                offset += 1
+            elif property_id == 0x02:  # Message Expiry Interval
+                expiry_interval = int.from_bytes(data[offset:offset + 4], 'big')
+                offset += 4
+
+        # Will Topic
+        will_topic_len = (data[offset] << 8) | data[offset + 1]
+        offset += 2
+        will_topic = data[offset:offset + will_topic_len].decode('utf-8')
+        offset += will_topic_len
+
+        # Will Message
+        will_message_len = (data[offset] << 8) | data[offset + 1]
+        offset += 2
+        will_message = data[offset:offset + will_message_len].decode('utf-8')
+        offset += will_message_len
+
+        print(f"Will Topic: {will_topic}, Will Message: {will_message}")
 
     return {
         "protocol_name": protocol_name,
@@ -81,7 +138,18 @@ def parse_connect_packet(data):
         "clean_session": clean_session,
         "keep_alive": keep_alive,
         "client_id": client_id,
+        "will_flag": will_flag,
+        "will_qos": will_qos,
+        "will_retain": will_retain,
+        "will_topic": will_topic,
+        "will_message": will_message,
+        "will_delay_interval": will_delay_interval,
+        "user_properties": user_properties,
     }
+
+
+
+
 
 
 def parse_publish_packet(data):
@@ -131,6 +199,7 @@ def parse_publish_packet(data):
         "packet_id": packet_id,
         "payload": payload,
     }
+
 
 def parse_variable_byte_integer(data):
     """Parse a Variable Byte Integer."""
@@ -241,6 +310,7 @@ def parse_subscribe_properties(data):
         else:
             raise ValueError(f"Unknown property ID: {prop_id}")
     return properties
+
 
 PACKET_TYPES = {
     1: "CONNECT",
