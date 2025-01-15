@@ -22,6 +22,16 @@ logging.basicConfig(
 )
 
 
+closed_sockets = set()
+closed_sockets_lock = threading.Lock()
+
+def close_socket_safe(client_socket):
+    """Close a socket safely to prevent double-closing."""
+    with closed_sockets_lock:
+        if client_socket not in closed_sockets:
+            closed_sockets.add(client_socket)
+            client_socket.close()
+
 def log_event(event_type, message, client_address=None, additional_data=None):
     """Log an event with structured data."""
     log_entry = {
@@ -35,7 +45,72 @@ def log_event(event_type, message, client_address=None, additional_data=None):
 
 # Subscription registry
 subscriptions = {}  # Dictionary to track subscribers: {topic: [client_sockets]}
+subscriptions_lock = threading.Lock()
 retained_messages = {}  # Dictionary to store retained messages: {topic: payload}
+
+client_wills = {} #Store LWT
+
+def add_subscription(topic, client_socket, qos_level):
+    """Add a subscription to a topic with a QoS level in a thread-safe way."""
+    with subscriptions_lock:
+        if topic not in subscriptions:
+            subscriptions[topic] = {}
+        subscriptions[topic][client_socket] = qos_level
+        log_event(
+            "SUBSCRIPTION_ADDED",
+            f"Subscription added to topic '{topic}' with QoS {qos_level}",
+            additional_data={"client_socket": str(client_socket), "topic": topic, "qos_level": qos_level},
+        )
+
+def remove_subscription(topic, client_socket):
+    """Remove a subscription to a topic in a thread-safe way."""
+    with subscriptions_lock:
+        if topic in subscriptions and client_socket in subscriptions[topic]:
+            del subscriptions[topic][client_socket]
+            log_event(
+                "SUBSCRIPTION_REMOVED",
+                f"Subscription removed from topic '{topic}'",
+                additional_data={"client_socket": str(client_socket), "topic": topic},
+            )
+            if not subscriptions[topic]:  # Clean up empty topic
+                del subscriptions[topic]
+
+def get_subscribers(topic):
+    """Get subscribers and their QoS levels for a topic in a thread-safe way."""
+    with subscriptions_lock:
+        return subscriptions.get(topic, {}).copy()
+
+def publish_lwt_message(lwt):
+    """Publish the Last Will and Testament message."""
+    try:
+        topic = lwt["will_topic"]
+        message = lwt["will_message"]
+        qos = lwt["will_qos"]
+        retain = lwt["will_retain"]
+
+        # Deliver the LWT message to subscribers
+        subscribers = get_subscribers(topic)
+        for subscriber_socket in subscribers:
+            try:
+                # Validate the socket
+                if not subscriber_socket or subscriber_socket.fileno() == -1:
+                    raise ValueError("Invalid or closed socket detected in subscriptions.")
+
+                send_custom_publish(subscriber_socket, topic, message, qos, packet_id=None, retain=retain)
+            except (socket.error, ValueError) as e:
+                remove_subscription(topic, subscriber_socket)
+                log_event("ERROR", f"Failed to deliver LWT to subscriber: {e}", additional_data={"topic": topic})
+
+        # Retain the message if required
+        if retain:
+            retained_messages[topic] = message
+            log_event(
+                "LWT_RETAINED",
+                "LWT message retained",
+                additional_data={"topic": topic, "message": message},
+            )
+    except Exception as e:
+        log_event("ERROR", f"Error publishing LWT message: {e}")
 
 
 def handle_client(client_socket, client_address):
@@ -45,7 +120,18 @@ def handle_client(client_socket, client_address):
         while True:
             data = client_socket.recv(1024)
             if not data:
-                log_event("DISCONNECTION", "Client disconnected", client_address=client_address)
+                # Unexpected disconnection: publish LWT if registered
+                if client_address in client_wills:
+                    lwt = client_wills.pop(client_address)
+                    log_event(
+                        "LWT_TRIGGERED",
+                        "Publishing Last Will and Testament",
+                        client_address=client_address,
+                        additional_data=lwt,
+                    )
+                    publish_lwt_message(lwt)
+
+                log_event("DISCONNECTION", "Client disconnected unexpectedly", client_address=client_address)
                 break
 
             # Parse the fixed header
@@ -54,7 +140,6 @@ def handle_client(client_socket, client_address):
             log_event("PACKET_RECEIVED", f"Received {packet_name} packet", client_address=client_address)
 
             # Handle packets
-
             if packet_type == 1:  # CONNECT
                 handle_connect_packet(data, client_socket, client_address)
             elif packet_type == 3:  # PUBLISH
@@ -73,7 +158,16 @@ def handle_client(client_socket, client_address):
     except Exception as e:
         log_event("ERROR", f"Error with client: {e}", client_address=client_address)
     finally:
-        client_socket.close()
+        # Remove client from all subscriptions
+        with subscriptions_lock:
+            for topic, clients in list(subscriptions.items()):
+                if client_socket in clients:
+                    del clients[client_socket]  # Proper way to remove a client from the dictionary
+                    if not clients:  # If no clients remain, remove the topic
+                        del subscriptions[topic]
+
+        # Close the socket
+        close_socket_safe(client_socket)
 
 
 def handle_connect_packet(data, client_socket, client_address):
@@ -88,6 +182,19 @@ def handle_connect_packet(data, client_socket, client_address):
                       additional_data=client_id)
 
         log_event("CONNECT", f"CONNECT received. Client ID: {client_id}", client_address=client_address)
+        if connect_info["will_flag"]:
+            client_wills[client_address] = {
+                "will_topic": connect_info["will_topic"],
+                "will_message": connect_info["will_message"],
+                "will_qos": connect_info["will_qos"],
+                "will_retain": connect_info["will_retain"],
+            }
+            log_event(
+                "LWT_REGISTERED",
+                "Last Will and Testament registered",
+                client_address=client_address,
+                additional_data=client_wills[client_address],
+            )
 
         # Construct CONNACK packet (MQTT v5 compliant)
         fixed_header = b'\x20'  # Packet Type = CONNACK
@@ -107,10 +214,14 @@ def construct_suback_packet(packet_id, granted_qos_list):
     try:
         fixed_header = b'\x90'  # Packet Type = SUBACK
         variable_header = packet_id.to_bytes(2, 'big')  # Packet Identifier
+
+        # MQTT v5 properties (empty)
+        properties = b'\x00'  # Properties length of 0 (no properties)
+
         payload = bytes(granted_qos_list)  # Granted QoS for each topic
 
-        remaining_length = len(variable_header) + len(payload)
-        suback_packet = fixed_header + remaining_length.to_bytes(1, 'big') + variable_header + payload
+        remaining_length = len(variable_header) + len(properties) + len(payload)
+        suback_packet = fixed_header + encode_remaining_length(remaining_length) + variable_header + properties + payload
         log_event("SUBACK_CONSTRUCTED", "SUBACK packet constructed",
                   additional_data={"packet_id": packet_id, "granted_qos_list": granted_qos_list})
         return suback_packet
@@ -143,20 +254,18 @@ def handle_subscribe_packet(data, client_socket, client_address):
             offset += topic_name_len
 
             subscription_options = data[offset]
-            qos = subscription_options & 0b11
+            qos = subscription_options & 0b11  # Extract the QoS level
             offset += 1
 
             topics.append((topic_name, qos))
 
-            if topic_name not in subscriptions:
-                subscriptions[topic_name] = []
-            if client_socket not in subscriptions[topic_name]:
-                subscriptions[topic_name].append(client_socket)
+            # Add subscription with QoS level
+            add_subscription(topic_name, client_socket, qos)
 
             # Send retained message if available
             if topic_name in retained_messages:
                 retained_payload = retained_messages[topic_name]
-                client_socket.send(retained_payload.encode('utf-8'))
+                send_custom_publish(client_socket, topic_name, retained_payload, qos, packet_id=None, retain=True)
 
         suback_packet = construct_suback_packet(packet_id, [qos for _, qos in topics])
         client_socket.send(suback_packet)
@@ -185,15 +294,17 @@ def handle_unsubscribe_packet(data, client_socket, client_address):
 
         for topic in topics:
             if topic in subscriptions:
-                if client_socket in subscriptions[topic]:
-                    subscriptions[topic].remove(client_socket)
-                    log_event(
-                        "UNSUBSCRIBE",
-                        f"Client unsubscribed from topic: {topic}",
-                        client_address=client_address
-                    )
-                    if not subscriptions[topic]:  # Cleanup empty topic
-                        del subscriptions[topic]
+                with subscriptions_lock:
+                    if client_socket in subscriptions[topic]:
+                        del subscriptions[topic][client_socket]  # Remove the client from the topic
+                        log_event(
+                            "UNSUBSCRIBE",
+                            f"Client unsubscribed from topic: {topic}",
+                            client_address=client_address
+                        )
+                        # Clean up the topic if no clients are subscribed
+                        if not subscriptions[topic]:
+                            del subscriptions[topic]
 
         # Construct and send UNSUBACK
         unsuback_packet = construct_unsuback_packet(packet_id)
@@ -204,6 +315,7 @@ def handle_unsubscribe_packet(data, client_socket, client_address):
         log_event("ERROR", f"Error processing UNSUBSCRIBE packet: {ve}", client_address=client_address)
     except Exception as e:
         log_event("ERROR", f"Unexpected error processing UNSUBSCRIBE packet: {e}", client_address=client_address)
+
 
 def encode_remaining_length(length):
     """Encode the remaining length as a Variable Byte Integer."""
@@ -219,11 +331,17 @@ def encode_remaining_length(length):
     return bytes(encoded_bytes)
 
 
-def send_custom_publish(client_socket, topic_name, payload, qos_level, packet_id):
-    """Send a tailored PUBLISH packet to a subscriber."""
+def send_custom_publish(client_socket, topic_name, payload, qos_level, packet_id=None, retain=False):
+    """Send a well-formed PUBLISH packet to a subscriber."""
     try:
-        # Fixed Header
+        # Ensure the object is a valid, open socket
+        if not client_socket or client_socket.fileno() == -1:
+            raise ValueError("Invalid or closed socket provided for publishing.")
+
+        # Construct Fixed Header
         flags = 0
+        if retain:
+            flags |= 0b0001  # Retain flag
         if qos_level == 1:
             flags |= 0b0010  # QoS 1
         elif qos_level == 2:
@@ -231,33 +349,43 @@ def send_custom_publish(client_socket, topic_name, payload, qos_level, packet_id
 
         fixed_header = bytes([(0x30 | flags)])  # PUBLISH packet type and flags
 
-        # Variable Header
+        # Construct Variable Header
         topic_name_bytes = topic_name.encode('utf-8')
         topic_name_length = len(topic_name_bytes).to_bytes(2, 'big')
 
         variable_header = topic_name_length + topic_name_bytes
 
-        # QoS 1 and 2 require Packet Identifier
+        # Add Packet Identifier for QoS 1 or 2
         if qos_level > 0:
+            if packet_id is None:
+                raise ValueError("Packet Identifier must be provided for QoS 1 or 2")
             variable_header += packet_id.to_bytes(2, 'big')
 
-        # Payload
-        payload_bytes = payload.encode('utf-8')
+        # Add MQTT v5 properties (no properties in this case)
+        properties = b'\x00'  # Properties length of 0 (no properties)
 
-        # Remaining Length
-        remaining_length = len(variable_header) + len(payload_bytes)
+        # Construct Payload
+        payload_bytes = (payload or "").encode('utf-8')
+
+
+        # Calculate Remaining Length
+        remaining_length = len(variable_header) + len(properties) + len(payload_bytes)
         remaining_length_bytes = encode_remaining_length(remaining_length)
 
-        # Final Packet
-        publish_packet = fixed_header + remaining_length_bytes + variable_header + payload_bytes
+        # Final PUBLISH Packet
+        publish_packet = fixed_header + remaining_length_bytes + variable_header + properties + payload_bytes
 
         # Send the packet
         client_socket.send(publish_packet)
-        log_event("PUBLISH_SENT", f"PUBLISH sent to subscriber with QoS {qos_level}",
-                  additional_data={"topic": topic_name, "qos": qos_level})
-    except Exception as e:
-        log_event("ERROR", f"Error sending PUBLISH to subscriber: {e}")
 
+        log_event(
+            "PUBLISH_SENT",
+            f"PUBLISH sent to subscriber with QoS {qos_level}, Retain={retain}",
+            client_address=client_socket.getpeername(),
+            additional_data={"topic": topic_name, "qos": qos_level, "payload": payload},
+        )
+    except (socket.error, ValueError) as e:
+        log_event("ERROR", f"Failed to send PUBLISH: {e}")
 
 def handle_publish_packet(data, client_socket, client_address):
     """Handle the PUBLISH packet."""
@@ -274,25 +402,38 @@ def handle_publish_packet(data, client_socket, client_address):
         # Handle retained messages
         retain_flag = publish_info.get("retain_flag", 0)
         if retain_flag:
-            retained_messages[topic_name] = payload
+            if payload == "":
+                # Remove retained message if the payload is empty
+                retained_messages.pop(topic_name, None)
+            else:
+                retained_messages[topic_name] = payload
 
         # Deliver the message to subscribers
         if topic_name in subscriptions:
-            for subscriber_socket in subscriptions[topic_name][:]:
+            for subscriber_socket, subscriber_qos in get_subscribers(topic_name).items():
                 try:
-                    send_custom_publish(subscriber_socket, topic_name, payload, qos_level, packet_id)
+                    effective_qos = min(qos_level, subscriber_qos)  # Use the lower QoS level
+                    send_custom_publish(subscriber_socket, topic_name, payload, effective_qos, packet_id)
                 except Exception as e:
-                    subscriptions[topic_name].remove(subscriber_socket)
-                    log_event("ERROR", "Failed to deliver message, subscriber removed", additional_data=topic_name)
+                    log_event("ERROR", f"Failed to deliver message to subscriber: {e}")
+                    remove_subscription(topic_name, subscriber_socket)
 
         # Handle QoS acknowledgments for the sender
         if qos_level == 1:
             send_puback(client_socket, packet_id)
         elif qos_level == 2:
+            # Update QoS 2 state
+            client_id = client_socket.getpeername()
+            if client_id not in qos2_state:
+                qos2_state[client_id] = {}
+            qos2_state[client_id][packet_id] = "PUBREC_SENT"
+
             send_pubrec(client_socket, packet_id)
 
     except Exception as e:
         log_event("ERROR", f"Error processing PUBLISH packet: {e}", client_address=client_address)
+
+
 
 def send_puback(client_socket, packet_id):
     """Send PUBACK packet."""
@@ -336,7 +477,6 @@ def handle_pubrel(data, client_socket):
     except Exception as e:
         log_event("ERROR", f"Error handling PUBREL: {e}")
 
-
 def send_pubcomp(client_socket, packet_id):
     """Send PUBCOMP packet."""
     try:
@@ -368,12 +508,26 @@ def handle_pingreq_packet(client_socket, client_address):
 def handle_disconnect_packet(client_socket, client_address):
     """Handle the DISCONNECT packet."""
     try:
-        # Simply log and close the connection
+        # Clean disconnect: remove LWT and QoS states
+        if client_address in client_wills:
+            del client_wills[client_address]
+            log_event("LWT_CLEARED", "Last Will and Testament cleared on clean disconnect", client_address=client_address)
+
+        if client_address in qos2_state:
+            del qos2_state[client_address]
+
         log_event("DISCONNECT", "Client requested disconnection", client_address=client_address)
-        client_socket.close()
+        #close_socket_safe(client_socket)
     except Exception as e:
         log_event("ERROR", f"Error processing DISCONNECT packet: {e}", client_address=client_address)
 
+
+def shutdown_server(server_socket):
+    log_event("SERVER_SHUTDOWN", "Shutting down server")
+    with closed_sockets_lock:
+        for sock in closed_sockets:
+            close_socket_safe(sock)
+    server_socket.close()
 
 def start_server():
     """Start the MQTT server."""
@@ -389,7 +543,7 @@ def start_server():
     except KeyboardInterrupt:
         log_event("SERVER_STOP", "Server shutting down...")
     finally:
-        server_socket.close()
+        shutdown_server(server_socket)
 
 
 if __name__ == "__main__":
