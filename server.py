@@ -114,22 +114,36 @@ def publish_lwt_message(lwt):
 
 
 def handle_client(client_socket, client_address):
-    """Handle an individual MQTT client."""
+    """Handle an individual MQTT client with delayed LWT support."""
     log_event("CONNECTION", "New connection established", client_address=client_address)
     try:
         while True:
             data = client_socket.recv(1024)
             if not data:
-                # Unexpected disconnection: publish LWT if registered
+                # Unexpected disconnection: schedule delayed LWT if registered
                 if client_address in client_wills:
                     lwt = client_wills.pop(client_address)
-                    log_event(
-                        "LWT_TRIGGERED",
-                        "Publishing Last Will and Testament",
-                        client_address=client_address,
-                        additional_data=lwt,
-                    )
-                    publish_lwt_message(lwt)
+                    delay = lwt.get("will_delay_interval", 0)
+
+                    if delay > 0:
+                        threading.Timer(
+                            delay,
+                            lambda: publish_lwt_message(lwt)  # Publish LWT after the delay
+                        ).start()
+                        log_event(
+                            "LWT_DELAYED",
+                            f"Delayed LWT scheduled in {delay} seconds",
+                            client_address=client_address,
+                            additional_data=lwt,
+                        )
+                    else:
+                        publish_lwt_message(lwt)  # Immediate LWT publishing
+                        log_event(
+                            "LWT_TRIGGERED",
+                            "Publishing Last Will and Testament immediately",
+                            client_address=client_address,
+                            additional_data=lwt,
+                        )
 
                 log_event("DISCONNECTION", "Client disconnected unexpectedly", client_address=client_address)
                 break
@@ -171,23 +185,56 @@ def handle_client(client_socket, client_address):
 
 
 def handle_connect_packet(data, client_socket, client_address):
-    """Handle the CONNECT packet."""
+    """Handle the CONNECT packet with authentication."""
     try:
         connect_info = parse_connect_packet(data[2:])  # Skip fixed header
         client_id = connect_info.get("client_id")
+        username = connect_info.get("username")
+        password = connect_info.get("password")
 
+
+        AUTH_USERS = {
+            "NONE": "NONE",
+            "user1": "password1",
+            "user2": "password2",
+            "user3": "password3",
+            "user4": "password4",
+        }
+
+        # Validate username and password
+        if username not in AUTH_USERS or AUTH_USERS[username] != password:
+            log_event(
+                "AUTH_FAILURE",
+                f"Authentication failed for username: {username}",
+                client_address=client_address,
+            )
+
+            # Construct CONNACK with error code 0x04 (Bad username or password)
+            connack_packet = b'\x20\x02\x00\x04'  # CONNACK with error code
+            client_socket.send(connack_packet)
+            close_socket_safe(client_socket)
+            return
+
+        # Generate client ID if not provided
         if not client_id:
             client_id = f"auto-{uuid.uuid4().hex[:8]}"
-            log_event("GENERATED_CLIENT_ID", "Generated Client ID", client_address=client_address,
-                      additional_data=client_id)
+            log_event(
+                "GENERATED_CLIENT_ID",
+                "Generated Client ID",
+                client_address=client_address,
+                additional_data=client_id,
+            )
 
         log_event("CONNECT", f"CONNECT received. Client ID: {client_id}", client_address=client_address)
+
+        # Handle Last Will and Testament (LWT)
         if connect_info["will_flag"]:
             client_wills[client_address] = {
                 "will_topic": connect_info["will_topic"],
                 "will_message": connect_info["will_message"],
                 "will_qos": connect_info["will_qos"],
                 "will_retain": connect_info["will_retain"],
+                "will_delay_interval": connect_info["will_delay_interval"],
             }
             log_event(
                 "LWT_REGISTERED",
@@ -198,7 +245,7 @@ def handle_connect_packet(data, client_socket, client_address):
 
         # Construct CONNACK packet (MQTT v5 compliant)
         fixed_header = b'\x20'  # Packet Type = CONNACK
-        variable_header = b'\x00\x00'  # Connect Acknowledge Flags and Return Code
+        variable_header = b'\x00\x00'  # Connect Acknowledge Flags and Return Code (Success)
         properties = b'\x00'  # Properties Length (no properties)
 
         remaining_length = len(variable_header) + len(properties)
@@ -206,8 +253,10 @@ def handle_connect_packet(data, client_socket, client_address):
 
         client_socket.send(connack_packet)
         log_event("CONNACK", "CONNACK sent", client_address=client_address, additional_data=client_id)
+
     except Exception as e:
         log_event("ERROR", f"Error processing CONNECT packet: {e}", client_address=client_address)
+
 
 def construct_suback_packet(packet_id, granted_qos_list):
     """Construct a SUBACK packet."""
