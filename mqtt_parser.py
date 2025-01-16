@@ -23,7 +23,7 @@ def parse_fixed_header(data):
 
 
 def parse_connect_packet(data):
-    """Parse the CONNECT packet, including LWT fields."""
+    """Parse the CONNECT packet, including LWT fields, username, and password."""
     offset = 0
     print(f"Raw data (hex): {data.hex()}")
 
@@ -49,6 +49,8 @@ def parse_connect_packet(data):
     will_qos = (connect_flags & 0x18) >> 3
     will_retain = (connect_flags & 0x20) >> 5
     clean_session = (connect_flags & 0x02) >> 1
+    username_flag = (connect_flags & 0x80) >> 7
+    password_flag = (connect_flags & 0x40) >> 6
     print(f"Offset {offset}: Connect Flags = {bin(connect_flags)}, Clean Session = {clean_session}, Will Flag = {will_flag}")
     offset += 1
 
@@ -132,6 +134,24 @@ def parse_connect_packet(data):
 
         print(f"Will Topic: {will_topic}, Will Message: {will_message}")
 
+    # Username
+    username = None
+    if username_flag:
+        username_len = (data[offset] << 8) | data[offset + 1]
+        offset += 2
+        username = data[offset:offset + username_len].decode('utf-8')
+        offset += username_len
+        print(f"Username: {username}")
+
+    # Password
+    password = None
+    if password_flag:
+        password_len = (data[offset] << 8) | data[offset + 1]
+        offset += 2
+        password = data[offset:offset + password_len].decode('utf-8')
+        offset += password_len
+        print(f"Password: {password}")
+
     return {
         "protocol_name": protocol_name,
         "protocol_level": protocol_level,
@@ -145,8 +165,9 @@ def parse_connect_packet(data):
         "will_message": will_message,
         "will_delay_interval": will_delay_interval,
         "user_properties": user_properties,
+        "username": username,
+        "password": password,
     }
-
 
 
 
